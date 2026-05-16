@@ -1,0 +1,21 @@
+{
+  "name": "flowmap-plugin",
+  "owner": {
+    "name": "flowmap"
+  },
+  "description": "Flowmap — visualize your web or React Native app's screen flow inside Claude Code.",
+  "plugins": [
+    {
+      "name": "flowmap",
+      "source": ".",
+      "description": "Analyze your web or React Native app's screen flow and sync to flowmap.app for visual diagrams. Supports Next.js (App/Pages Router), Expo Router, and React Native with React Navigation. Captures every navigation across screen files and the components they import.",
+      "version": "0.1.0",
+      "author": {
+        "name": "flowmap"
+      },
+      "homepage": "https://flowmap.app",
+      "license": "MIT",
+      "keywords": ["flow", "navigation", "diagram", "next.js", "expo", "react-native"]
+    }
+  ]
+}

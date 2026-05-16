@@ -1,0 +1,14 @@
+{
+  "name": "flowmap-plugin",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": { "node": ">=20" },
+  "dependencies": {
+    "@babel/parser": "^7.26.5",
+    "@babel/traverse": "^7.26.5",
+    "@babel/types": "^7.26.5",
+    "fast-glob": "^3.3.3",
+    "puppeteer-core": "^24.0.0"
+  }
+}
