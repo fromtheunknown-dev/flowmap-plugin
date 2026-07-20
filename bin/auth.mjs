@@ -11,7 +11,7 @@ import path from "node:path";
 import os from "node:os";
 
 export const DEFAULT_API_BASE =
-  process.env.FLOWMAP_API_BASE ?? "http://100.126.10.77:3030";
+  process.env.FLOWMAP_API_BASE ?? "https://main.d7e1xpcc6umrt.amplifyapp.com";
 
 const TOKEN_DIR = path.join(
   process.env.XDG_CONFIG_HOME ?? path.join(os.homedir(), ".config"),
