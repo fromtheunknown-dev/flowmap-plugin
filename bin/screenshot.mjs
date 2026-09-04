@@ -2,10 +2,16 @@
  * Screenshot capture against the user's already-running dev server.
  * Uses puppeteer-core + system Chromium / Chrome (no bundled binary).
  *
+ * Each page visit yields two artefacts: the PNG, and the scene graph behind it
+ * (see snapshot.mjs). They are captured from the same paint so they can never
+ * disagree, and one navigation pays for both. A scene that fails to capture is
+ * dropped rather than propagated — the screenshot is still worth uploading.
+ *
  * Skips dynamic routes ([param], [...slug]) for V1 — they require sample data.
  * Skips synthetic "unknown:" / "external:" routes from the analyzer.
  */
 import { existsSync } from "node:fs";
+import { captureSceneGraph } from "./snapshot.mjs";
 
 const VIEWPORTS = {
   desktop: { width: 1280, height: 800, deviceScaleFactor: 1 },
@@ -43,13 +49,13 @@ function findBrowserExecutable() {
 export async function captureScreenshots({ devServerUrl, screens, viewports = ["desktop", "mobile"], timeout = 8000, concurrency = 2 }) {
   const browserExe = findBrowserExecutable();
   if (!browserExe) {
-    return { skipped: true, reason: "no-browser", shots: [] };
+    return { skipped: true, reason: "no-browser", shots: [], fontFaces: "" };
   }
   let puppeteer;
   try {
     puppeteer = (await import("puppeteer-core")).default ?? (await import("puppeteer-core"));
   } catch {
-    return { skipped: true, reason: "puppeteer-core not installed", shots: [] };
+    return { skipped: true, reason: "puppeteer-core not installed", shots: [], fontFaces: "" };
   }
 
   // Health check
@@ -59,7 +65,7 @@ export async function captureScreenshots({ devServerUrl, screens, viewports = ["
       // 404/401/307 are still proof the server is up
     }
   } catch (err) {
-    return { skipped: true, reason: `dev server unreachable at ${devServerUrl}: ${err.message}`, shots: [] };
+    return { skipped: true, reason: `dev server unreachable at ${devServerUrl}: ${err.message}`, shots: [], fontFaces: "" };
   }
 
   const browser = await puppeteer.launch({
@@ -75,6 +81,7 @@ export async function captureScreenshots({ devServerUrl, screens, viewports = ["
   );
 
   const shots = [];
+  let fontFaces = "";
   let pending = targets.flatMap((s) => viewports.map((vp) => ({ screen: s, viewport: vp })));
 
   async function worker() {
@@ -90,7 +97,19 @@ export async function captureScreenshots({ devServerUrl, screens, viewports = ["
         // small settle delay so client-side hydration paints
         await new Promise((r) => setTimeout(r, 400));
         const buf = await page.screenshot({ type: "png", fullPage: false });
-        shots.push({ screenId: screen.id, viewport, buffer: buf });
+
+        let scene = null;
+        try {
+          const captured = await captureSceneGraph(page, VIEWPORTS[viewport]);
+          scene = captured.scene;
+          // Identical on every route, so the first one that comes back wins.
+          if (!fontFaces && captured.fontFaces) fontFaces = captured.fontFaces;
+        } catch {
+          // Scene capture is additive: a screen without one is still viewable,
+          // just not editable. Never let it cost us the screenshot.
+        }
+
+        shots.push({ screenId: screen.id, viewport, buffer: buf, scene });
         await page.close();
       } catch (err) {
         // Skip this one but don't fail the run
@@ -103,5 +122,5 @@ export async function captureScreenshots({ devServerUrl, screens, viewports = ["
   await Promise.all(workers);
 
   await browser.close();
-  return { skipped: false, shots };
+  return { skipped: false, shots, fontFaces };
 }

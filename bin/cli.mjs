@@ -149,6 +149,7 @@ async function runVisualize(args) {
   // a web browser, and Expo Router / React Navigation apps have no web target.
   const RN_FRAMEWORKS = new Set(["expo-router", "react-navigation"]);
   let shots = [];
+  let fontFaces = "";
   if (RN_FRAMEWORKS.has(stats.framework)) {
     process.stderr.write(
       `⚠ Screenshots skipped: React Native (${stats.framework}) has no web target — metadata-only sync\n`,
@@ -164,9 +165,12 @@ async function runVisualize(args) {
       process.stderr.write(`⚠ Screenshots skipped: ${cap.reason}\n`);
     } else {
       shots = cap.shots;
+      fontFaces = cap.fontFaces ?? "";
       const ok = shots.filter((s) => !s.error).length;
       const failed = shots.length - ok;
+      const scenes = shots.filter((s) => s.scene).length;
       process.stderr.write(`✓ ${ok} screenshots captured (${failed} failed)\n`);
+      process.stderr.write(`✓ ${scenes} editable scenes captured\n`);
     }
   }
 
@@ -176,6 +180,7 @@ async function runVisualize(args) {
     projectId,
     manifest,
     screenshots: shots,
+    fontFaces,
     pluginVersion: PLUGIN_PKG.version,
   });
 
@@ -204,6 +209,8 @@ async function runVisualize(args) {
     descriptions: describedCount,
     screenshotsUploaded: result.uploaded_screenshots ?? 0,
     screenshotsReused: result.reused_screenshots ?? 0,
+    scenesUploaded: result.uploaded_scenes ?? 0,
+    scenesReused: result.reused_scenes ?? 0,
     framework: stats.framework,
   };
   console.log(JSON.stringify(out));

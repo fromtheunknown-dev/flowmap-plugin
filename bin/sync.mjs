@@ -8,6 +8,7 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import os from "node:os";
+import { gzipSync } from "node:zlib";
 import { apiFetch } from "./auth.mjs";
 
 const CONFIG_DIR_NAME = ".flowmap";
@@ -37,7 +38,13 @@ export async function ensureProject({ cwd, name, fingerprint }) {
   return { projectId, configPath, reused: false };
 }
 
-export async function syncSnapshot({ projectId, manifest, screenshots, pluginVersion }) {
+export async function syncSnapshot({
+  projectId,
+  manifest,
+  screenshots,
+  fontFaces,
+  pluginVersion,
+}) {
   const form = new FormData();
   form.set(
     "manifest",
@@ -52,14 +59,34 @@ export async function syncSnapshot({ projectId, manifest, screenshots, pluginVer
     ),
   );
   let uploadedShots = 0;
+  let uploadedScenes = 0;
   for (const s of screenshots ?? []) {
-    if (s.error || !s.buffer) continue;
-    form.set(
-      `screenshot[${s.screenId}][${s.viewport}]`,
-      new Blob([s.buffer], { type: "image/png" }),
-      `${s.screenId}.${s.viewport}.png`,
-    );
-    uploadedShots++;
+    if (s.error) continue;
+    if (s.buffer) {
+      form.set(
+        `screenshot[${s.screenId}][${s.viewport}]`,
+        new Blob([s.buffer], { type: "image/png" }),
+        `${s.screenId}.${s.viewport}.png`,
+      );
+      uploadedShots++;
+    }
+    // Gzipped on the client: the graph is repetitive JSON and compresses ~8x,
+    // which is what makes it cheaper to ship than the PNG beside it.
+    if (s.scene) {
+      const gz = gzipSync(Buffer.from(JSON.stringify(s.scene), "utf8"), { level: 9 });
+      form.set(
+        `scene[${s.screenId}][${s.viewport}]`,
+        new Blob([gz], { type: "application/gzip" }),
+        `${s.screenId}.${s.viewport}.json.gz`,
+      );
+      uploadedScenes++;
+    }
+  }
+
+  // One copy per sync, not per screen — see the route's own note on why these
+  // are both unskippable and worth deduplicating.
+  if (fontFaces) {
+    form.set("fontFaces", new Blob([fontFaces], { type: "text/css" }), "fonts.css");
   }
 
   const res = await apiFetch(`/api/projects/${projectId}/snapshots`, {
@@ -70,7 +97,7 @@ export async function syncSnapshot({ projectId, manifest, screenshots, pluginVer
   if (!res.ok) {
     throw new Error(`snapshot sync failed: ${res.status} ${JSON.stringify(body)}`);
   }
-  return { ...body, uploadedShotsAttempted: uploadedShots };
+  return { ...body, uploadedShotsAttempted: uploadedShots, uploadedScenesAttempted: uploadedScenes };
 }
 
 async function readJsonSafe(p) {
