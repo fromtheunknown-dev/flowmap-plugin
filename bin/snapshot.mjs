@@ -92,8 +92,16 @@ export async function captureSceneGraph(page, viewport) {
     // Webfonts have to travel with the graph: re-rendering with fallback
     // metrics moves every line box and the capture stops being a record of
     // what the user saw.
+    //
+    // The document's custom properties travel with them, in the same blob.
+    // Captured styles are computed, so `var(--x)` has already resolved to a
+    // literal — but carrying the definitions lets an editor write a `var()`
+    // reference back and have it keep resolving, which is what turns "picked a
+    // token" into a binding rather than a copy.
     const fontFaces = await page.evaluate(() => {
       const out = [];
+      const custom = new Map();
+
       for (const sheet of document.styleSheets) {
         let rules;
         try {
@@ -102,8 +110,28 @@ export async function captureSceneGraph(page, viewport) {
           continue; // cross-origin stylesheet
         }
         for (const rule of rules) {
-          if (rule.constructor.name === "CSSFontFaceRule") out.push(rule.cssText);
+          if (rule.constructor.name === "CSSFontFaceRule") {
+            out.push(rule.cssText);
+            continue;
+          }
+          // Only :root declarations. A custom property scoped to a component
+          // means something different inside that component, and hoisting it
+          // to the document would change what it resolves to.
+          if (rule.constructor.name !== "CSSStyleRule") continue;
+          if (rule.selectorText !== ":root" && rule.selectorText !== "html") continue;
+          for (const property of rule.style) {
+            if (property.startsWith("--")) {
+              custom.set(property, rule.style.getPropertyValue(property).trim());
+            }
+          }
         }
+      }
+
+      if (custom.size > 0) {
+        const declarations = [...custom]
+          .map(([name, value]) => `  ${name}: ${value};`)
+          .join("\n");
+        out.push(`:root {\n${declarations}\n}`);
       }
       return out.join("\n");
     });
