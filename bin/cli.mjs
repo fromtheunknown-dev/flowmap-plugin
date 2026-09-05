@@ -160,6 +160,9 @@ async function runVisualize(args) {
       devServerUrl,
       screens: manifest.screens,
       viewports: ["desktop", "mobile"],
+      // `.flowmap/config.json` may name a URL per dynamic route; see
+      // screenshot.mjs for why discovery alone is not always enough.
+      sampleUrls: (await readFlowmapConfig(cwd))?.routeSamples ?? {},
     });
     if (cap.skipped) {
       process.stderr.write(`⚠ Screenshots skipped: ${cap.reason}\n`);
@@ -306,6 +309,22 @@ function parseArgs(argv) {
     }
   }
   return out;
+}
+
+/**
+ * The project's own `.flowmap/config.json`.
+ *
+ * Written by `ensureProject` to hold the project id; anything else in it is the
+ * developer's, and read from here. Missing or unreadable is not an error — the
+ * file is optional and a malformed one should not stop a sync.
+ */
+async function readFlowmapConfig(cwd) {
+  try {
+    const raw = await fs.readFile(path.join(cwd, ".flowmap", "config.json"), "utf8");
+    return JSON.parse(raw);
+  } catch {
+    return null;
+  }
 }
 
 function printHelp() {

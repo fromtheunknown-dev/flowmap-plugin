@@ -7,7 +7,21 @@
  * disagree, and one navigation pays for both. A scene that fails to capture is
  * dropped rather than propagated — the screenshot is still worth uploading.
  *
- * Skips dynamic routes ([param], [...slug]) for V1 — they require sample data.
+ * Dynamic routes are captured from real URLs, found two ways.
+ *
+ * `/s/chat/[id]` cannot be opened without an id, and inventing one produces a
+ * not-found page rather than the screen. The static pages just captured are
+ * usually full of real ones — a chat list links to real chats — so their hrefs
+ * are collected during the first pass and matched against the patterns
+ * afterwards.
+ *
+ * That finds nothing in an app that navigates with `router.push` instead of
+ * links, or one whose lists are empty because the dev server has no backend
+ * behind it. Both are ordinary, so `sampleUrls` lets the developer name a URL
+ * per pattern in `.flowmap/config.json` and always works:
+ *
+ *     { "routeSamples": { "/s/chat/[id]": ["/s/chat/42"] } }
+ *
  * Skips synthetic "unknown:" / "external:" routes from the analyzer.
  */
 import { existsSync } from "node:fs";
@@ -46,7 +60,7 @@ function findBrowserExecutable() {
   return null;
 }
 
-export async function captureScreenshots({ devServerUrl, screens, viewports = ["desktop", "mobile"], timeout = 8000, concurrency = 2 }) {
+export async function captureScreenshots({ devServerUrl, screens, viewports = ["desktop", "mobile"], timeout = 8000, concurrency = 2, samplesPerRoute = 1, sampleUrls = {} }) {
   const browserExe = findBrowserExecutable();
   if (!browserExe) {
     return { skipped: true, reason: "no-browser", shots: [], fontFaces: "" };
@@ -75,24 +89,32 @@ export async function captureScreenshots({ devServerUrl, screens, viewports = ["
   });
 
   // Filter targets: skip dynamic and synthetic
-  const targets = screens.filter((s) =>
-    s.routePath.startsWith("/") &&
-    !/\[/.test(s.routePath),
+  const isDynamic = (routePath) => /\[/.test(routePath);
+  const staticScreens = screens.filter(
+    (s) => s.routePath.startsWith("/") && !isDynamic(s.routePath),
+  );
+  const dynamicScreens = screens.filter(
+    (s) => s.routePath.startsWith("/") && isDynamic(s.routePath),
   );
 
   const shots = [];
   let fontFaces = "";
-  let pending = targets.flatMap((s) => viewports.map((vp) => ({ screen: s, viewport: vp })));
+  /** Hrefs the captured pages linked to, for resolving dynamic routes. */
+  const discovered = new Set();
+  let pending = staticScreens.flatMap((s) =>
+    viewports.map((vp) => ({ screen: s, viewport: vp })),
+  );
 
   async function worker() {
     while (pending.length) {
       const job = pending.shift();
       if (!job) return;
       const { screen, viewport } = job;
+      const routePath = job.url ?? screen.routePath;
       try {
         const page = await browser.newPage();
         await page.setViewport(VIEWPORTS[viewport]);
-        const url = `${devServerUrl.replace(/\/$/, "")}${screen.routePath}`;
+        const url = `${devServerUrl.replace(/\/$/, "")}${routePath}`;
         await page.goto(url, { waitUntil: "domcontentloaded", timeout });
         // small settle delay so client-side hydration paints
         await new Promise((r) => setTimeout(r, 400));
@@ -109,7 +131,30 @@ export async function captureScreenshots({ devServerUrl, screens, viewports = ["
           // just not editable. Never let it cost us the screenshot.
         }
 
-        shots.push({ screenId: screen.id, viewport, buffer: buf, scene });
+        // Same-origin links only, and without query or hash: a dynamic route is
+        // identified by its path, and carrying the rest would capture the same
+        // screen several times over.
+        if (job.collectLinks) {
+          try {
+            const hrefs = await page.evaluate(() =>
+              [...document.querySelectorAll("a[href]")]
+                .map((a) => a.getAttribute("href"))
+                .filter((href) => href && href.startsWith("/"))
+                .map((href) => href.split(/[?#]/)[0]),
+            );
+            for (const href of hrefs) discovered.add(href);
+          } catch {
+            // A page that will not hand over its links still yields its shot.
+          }
+        }
+
+        shots.push({
+          screenId: screen.id,
+          viewport,
+          buffer: buf,
+          scene,
+          capturedPath: job.url ?? screen.routePath,
+        });
         await page.close();
       } catch (err) {
         // Skip this one but don't fail the run
@@ -118,9 +163,80 @@ export async function captureScreenshots({ devServerUrl, screens, viewports = ["
     }
   }
 
-  const workers = Array.from({ length: Math.min(concurrency, pending.length || 1) }, () => worker());
-  await Promise.all(workers);
+  // Pass 1: the routes that can be opened by name, collecting links as they go.
+  for (const job of pending) job.collectLinks = true;
+  await Promise.all(
+    Array.from({ length: Math.min(concurrency, pending.length || 1) }, () => worker()),
+  );
+
+  // Pass 2: dynamic routes. A URL the developer named wins over a discovered
+  // one — they know which record makes the screen worth looking at.
+  const resolved = [];
+  const claimed = new Set();
+  for (const screen of dynamicScreens) {
+    for (const url of sampleUrls[screen.routePath] ?? []) {
+      if (typeof url !== "string" || !url.startsWith("/")) continue;
+      resolved.push({ screen, url });
+      claimed.add(screen.routePath);
+    }
+  }
+  resolved.push(
+    ...matchDynamicRoutes(
+      dynamicScreens.filter((s) => !claimed.has(s.routePath)),
+      discovered,
+      samplesPerRoute,
+    ),
+  );
+  if (resolved.length > 0) {
+    pending = resolved.flatMap((entry) =>
+      viewports.map((vp) => ({ screen: entry.screen, viewport: vp, url: entry.url })),
+    );
+    await Promise.all(
+      Array.from({ length: Math.min(concurrency, pending.length) }, () => worker()),
+    );
+  }
 
   await browser.close();
-  return { skipped: false, shots, fontFaces };
+  return { skipped: false, shots, fontFaces, resolvedDynamic: resolved.length };
+}
+
+
+/**
+ * Turns `/s/chat/[id]` into a URL the app actually linked to.
+ *
+ * Longest pattern first, so `/s/chat/[id]/settings` claims its own links before
+ * `/s/chat/[id]` would swallow them — otherwise the more specific screen never
+ * gets captured. A catch-all (`[...slug]`) matches the rest of the path;
+ * everything else matches one segment.
+ */
+function matchDynamicRoutes(screens, hrefs, samplesPerRoute) {
+  const patterns = [...screens]
+    .sort((a, b) => b.routePath.split("/").length - a.routePath.split("/").length)
+    .map((screen) => ({ screen, regex: toRegex(screen.routePath) }));
+
+  const taken = new Set();
+  const out = [];
+  for (const { screen, regex } of patterns) {
+    let found = 0;
+    for (const href of hrefs) {
+      if (found >= samplesPerRoute) break;
+      if (taken.has(href) || !regex.test(href)) continue;
+      taken.add(href);
+      out.push({ screen, url: href });
+      found++;
+    }
+  }
+  return out;
+}
+
+function toRegex(routePath) {
+  const source = routePath
+    .split("/")
+    .map((segment) => {
+      if (/^\[\.\.\..+\]$/.test(segment)) return "(?:[^/]+/)*[^/]+";
+      if (/^\[.+\]$/.test(segment)) return "[^/]+";
+      return segment.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    })
+    .join("/");
+  return new RegExp(`^${source}$`);
 }
