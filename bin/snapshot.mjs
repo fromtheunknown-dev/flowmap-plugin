@@ -62,6 +62,10 @@ export const DESIGN_PROPS = [
 const FORM_ATTRS = [
   "type", "min", "max", "step", "placeholder", "disabled", "readonly",
   "multiple", "name",
+  // `progress` and `meter` keep their position in the markup, not in the
+  // snapshot's `inputValue`, which the browser fills in for text fields only.
+  // Without it both came back as empty grey troughs.
+  "value",
 ];
 const FORM_TAGS = new Set(["input", "select", "textarea", "progress", "meter"]);
 
@@ -255,6 +259,33 @@ export function normalise(raw, { url, viewport, svgs = [] }) {
   const nodes = [];
   const emitted = new Map(); // CDP node index -> our node index
 
+  /** Concatenated text of a subtree, read straight from the node tree. */
+  const textUnder = (cdpIdx) => {
+    let out = "";
+    for (const kid of children.get(cdpIdx) ?? []) {
+      out += N.nodeType[kid] === 3 ? (str(N.nodeValue?.[kid]) ?? "") : textUnder(kid);
+    }
+    return out;
+  };
+
+  /** The label of a select's chosen option, or its first one as a fallback. */
+  const selectedOptionLabel = (cdpIdx) => {
+    let first = null;
+    const visit = (idx) => {
+      if ((str(N.nodeName[idx]) ?? "").toLowerCase() === "option") {
+        const label = textUnder(idx).trim();
+        if (first === null) first = label;
+        return rareIncludes(N.optionSelected, idx) ? label : null;
+      }
+      for (const kid of children.get(idx) ?? []) {
+        const hit = visit(kid);
+        if (hit !== null) return hit;
+      }
+      return null;
+    };
+    return visit(cdpIdx) ?? first;
+  };
+
   function walk(cdpIdx, parentOut) {
     const rawName = str(N.nodeName[cdpIdx]);
     const tag = rawName ? rawName.toLowerCase() : "";
@@ -304,6 +335,19 @@ export function normalise(raw, { url, viewport, svgs = [] }) {
         // reads its position from here and nowhere else.
         const value = rareValue(N.inputValue, cdpIdx);
         if (value !== undefined) form.value = str(value) ?? "";
+        // A textarea's content is a child text node, and that node has no box
+        // of its own, so the walk never reaches it. The snapshot carries the
+        // text here instead — otherwise every textarea rebuilt empty.
+        const typed = rareValue(N.textValue, cdpIdx);
+        if (typed !== undefined) form.value = str(typed) ?? "";
+        // An <option> has no box either, so a rebuilt <select> had nothing
+        // inside it: no label, and no arrow, since the UA draws neither for an
+        // empty select. Carrying the chosen label back as the sole option
+        // reproduces the closed control, which is all a still frame ever shows.
+        if (tag === "select") {
+          const label = selectedOptionLabel(cdpIdx);
+          if (label !== null) form.$option = label;
+        }
         if (rareIncludes(N.inputChecked, cdpIdx)) form.checked = "";
         if (rareIncludes(N.optionSelected, cdpIdx)) form.selected = "";
         if (Object.keys(form).length > 0) node.form = intern(JSON.stringify(form));
