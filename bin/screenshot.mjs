@@ -137,7 +137,7 @@ export async function captureScreenshots({ devServerUrl, screens, viewports = ["
         try {
           const captured = await captureSceneGraph(page, VIEWPORTS[viewport]);
           scene = captured.scene;
-          // Identical on every route, so the first one that comes back wins.
+          // Pooled, not replaced: see `cssRules`.
           for (const rule of (captured.fontFaces ?? "").split("\n")) {
             if (rule.trim()) cssRules.add(rule);
           }
