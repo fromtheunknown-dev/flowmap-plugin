@@ -44,7 +44,26 @@ export const DESIGN_PROPS = [
   "transform-origin","filter","backdrop-filter","mix-blend-mode","isolation",
   "visibility","pointer-events","cursor","object-fit","object-position",
   "aspect-ratio","clip-path","mask-image",
+  // A control styled by the page sets `appearance: none` on itself; without it
+  // the browser draws its native widget and the page's own thumb and track
+  // rules never take effect.
+  "appearance","accent-color",
 ];
+
+/**
+ * Attributes that decide how the browser draws a form control.
+ *
+ * A control's interior is UA shadow DOM — the thumb of a range, the tick of a
+ * checkbox, the arrow of a select — and none of it appears in the snapshot as
+ * nodes. Re-emitting the real element with these attributes lets the browser
+ * draw its own internals, which is both exact and free; substituting a div and
+ * trying to paint a thumb by hand would be neither.
+ */
+const FORM_ATTRS = [
+  "type", "min", "max", "step", "placeholder", "disabled", "readonly",
+  "multiple", "name",
+];
+const FORM_TAGS = new Set(["input", "select", "textarea", "progress", "meter"]);
 
 /** Nothing under these ever paints; walking into them only inflates the graph. */
 const DROP_TAGS = new Set([
@@ -114,10 +133,25 @@ export async function captureSceneGraph(page, viewport) {
             out.push(rule.cssText);
             continue;
           }
+          if (rule.constructor.name !== "CSSStyleRule") continue;
+
+          // Rules that style the inside of a form control.
+          //
+          // A range's thumb, a progress bar's fill: these live in UA shadow DOM
+          // and never appear in the snapshot as nodes, and asking
+          // getComputedStyle for them returns the element's own styles rather
+          // than the pseudo-element's. Carrying the rules verbatim is the only
+          // way to get the product's own slider back instead of the browser's
+          // default blue one — and they are inert against anything else,
+          // because the selector says exactly what they can reach.
+          if (/::-(webkit|moz)-/.test(rule.selectorText)) {
+            out.push(rule.cssText);
+            continue;
+          }
+
           // Only :root declarations. A custom property scoped to a component
           // means something different inside that component, and hoisting it
           // to the document would change what it resolves to.
-          if (rule.constructor.name !== "CSSStyleRule") continue;
           if (rule.selectorText !== ":root" && rule.selectorText !== "html") continue;
           for (const property of rule.style) {
             if (property.startsWith("--")) {
@@ -180,6 +214,15 @@ export function normalise(raw, { url, viewport, svgs = [] }) {
   (L.paintOrders ?? []).forEach((order, layoutIdx) => paintOrder.set(layoutIdx, order));
 
   const str = (i) => (i === undefined || i === -1 ? null : S[i]);
+
+  /* CDP encodes sparse per-node data as {index, value} pairs. */
+  const rareValue = (rare, nodeIdx) => {
+    if (!rare?.index) return undefined;
+    const at = rare.index.indexOf(nodeIdx);
+    return at < 0 ? undefined : rare.value?.[at];
+  };
+  const rareIncludes = (rare, nodeIdx) =>
+    Array.isArray(rare?.index) ? rare.index.includes(nodeIdx) : false;
 
   const attrsOf = (nodeIdx) => {
     const flat = N.attributes[nodeIdx] ?? [];
@@ -249,6 +292,21 @@ export function normalise(raw, { url, viewport, svgs = [] }) {
       if (pseudo) node.pseudo = intern(pseudo);
       if (tag === "img") {
         node.src = intern(str(N.currentSourceURL?.[cdpIdx]) ?? attrs.src ?? "");
+      }
+      if (FORM_TAGS.has(tag)) {
+        const form = {};
+        for (const name of FORM_ATTRS) {
+          if (attrs[name] !== undefined && attrs[name] !== null) {
+            form[name] = attrs[name];
+          }
+        }
+        // The live value, not the markup default: a slider the user has moved
+        // reads its position from here and nowhere else.
+        const value = rareValue(N.inputValue, cdpIdx);
+        if (value !== undefined) form.value = str(value) ?? "";
+        if (rareIncludes(N.inputChecked, cdpIdx)) form.checked = "";
+        if (rareIncludes(N.optionSelected, cdpIdx)) form.selected = "";
+        if (Object.keys(form).length > 0) node.form = intern(JSON.stringify(form));
       }
       if (N.isClickable?.index?.includes(cdpIdx)) node.click = 1;
     } else {
