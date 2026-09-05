@@ -17,7 +17,7 @@ import os from "node:os";
 import { fileURLToPath } from "node:url";
 import * as auth from "./auth.mjs";
 import { analyze } from "./analyze.mjs";
-import { captureScreenshots } from "./screenshot.mjs";
+import { captureScreenshots, globToRegExp } from "./screenshot.mjs";
 import { ensureProject, syncSnapshot } from "./sync.mjs";
 
 const PLUGIN_ROOT = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
@@ -170,6 +170,8 @@ async function runVisualize(args) {
       // `.flowmap/config.json` may name a URL per dynamic route; see
       // screenshot.mjs for why discovery alone is not always enough.
       sampleUrls: config?.routeSamples ?? {},
+      // Signed in, with canned answers, for the length of the capture only.
+      session: await readCaptureSession(cwd, config),
     });
     if (cap.skipped) {
       process.stderr.write(`⚠ Screenshots skipped: ${cap.reason}\n`);
@@ -181,6 +183,18 @@ async function runVisualize(args) {
       const scenes = shots.filter((s) => s.scene).length;
       process.stderr.write(`✓ ${ok} screenshots captured (${failed} failed)\n`);
       process.stderr.write(`✓ ${scenes} editable scenes captured\n`);
+      // A screen that got past the login and then had nothing to show is still
+      // a spinner. These are the calls that would fill it in.
+      const unmocked = cap.unmocked ?? [];
+      if (unmocked.length > 0) {
+        process.stderr.write(
+          `  ${unmocked.length} API call${unmocked.length === 1 ? "" : "s"} went unmocked — add these to capture.mocks to render the screens behind them:\n`,
+        );
+        for (const call of unmocked.slice(0, 20)) process.stderr.write(`    ${call}\n`);
+        if (unmocked.length > 20) {
+          process.stderr.write(`    … and ${unmocked.length - 20} more\n`);
+        }
+      }
     }
   }
 
@@ -336,6 +350,50 @@ async function readFlowmapConfig(cwd) {
   }
 }
 
+/**
+ * The `capture` block of the project's config, with its mocks made usable.
+ *
+ * Bodies are read from disk here rather than per request: a screen is visited
+ * once per viewport, several screens run at once, and re-reading the same
+ * fixture for every call would turn one file into hundreds of reads.
+ *
+ * A rule that cannot be loaded is dropped with a warning. The capture is worth
+ * running with three of four fixtures; it is not worth failing over one path
+ * typed wrong.
+ */
+async function readCaptureSession(cwd, config) {
+  const capture = config?.capture;
+  if (!capture || typeof capture !== "object") return null;
+
+  const mocks = [];
+  for (const rule of Array.isArray(capture.mocks) ? capture.mocks : []) {
+    if (!rule?.url) continue;
+    let body = rule.body;
+    if (rule.file) {
+      try {
+        body = await fs.readFile(path.resolve(cwd, ".flowmap", rule.file), "utf8");
+      } catch (err) {
+        process.stderr.write(`  ! mock ${rule.url}: ${err.message}\n`);
+        continue;
+      }
+    }
+    mocks.push({
+      pattern: globToRegExp(rule.url),
+      method: rule.method,
+      status: rule.status,
+      contentType: rule.contentType,
+      body: typeof body === "string" ? body : JSON.stringify(body ?? {}),
+    });
+  }
+
+  const session = {
+    localStorage: capture.localStorage ?? null,
+    cookies: Array.isArray(capture.cookies) ? capture.cookies : null,
+    mocks,
+  };
+  return session.localStorage || session.cookies || mocks.length > 0 ? session : null;
+}
+
 function printHelp() {
   console.log(`flowmap ${PLUGIN_PKG.version}
 
@@ -355,6 +413,12 @@ The plugin is invoked via Claude Code skills:
 .flowmap/config.json (optional, yours to edit):
   routeSamples  a real URL per dynamic route, so it can be captured
                   { "/s/chat/[id]": ["/s/chat/42"] }
+  capture       the session the capture runs under, so screens behind a login
+                render instead of redirecting to it
+                  { "localStorage": { "token": "capture-only" },
+                    "mocks": [ { "url": "**/users/me", "file": "me.json" } ] }
+                Mock files are paths inside .flowmap/. First matching rule
+                answers; anything unmatched goes to the network as usual.
   aliases       what a URL fragment stands for, so a navigation built from a
                 variable resolves to real screens instead of a dead end
                   { "useRoleBase": ["/s", "/t"] }

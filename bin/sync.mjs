@@ -45,59 +45,119 @@ export async function syncSnapshot({
   fontFaces,
   pluginVersion,
 }) {
-  const form = new FormData();
-  form.set(
-    "manifest",
-    new Blob([JSON.stringify(manifest)], { type: "application/json" }),
-    "manifest.json",
-  );
-  form.set(
-    "syncedFrom",
-    new Blob(
-      [JSON.stringify({ hostname: os.hostname(), pluginVersion: pluginVersion ?? "0.1.0" })],
-      { type: "application/json" },
-    ),
-  );
+  // Each screen's assets, packed once and then dealt into requests.
+  const assets = [];
   let uploadedShots = 0;
   let uploadedScenes = 0;
   for (const s of screenshots ?? []) {
     if (s.error) continue;
     if (s.buffer) {
-      form.set(
-        `screenshot[${s.screenId}][${s.viewport}]`,
-        new Blob([s.buffer], { type: "image/png" }),
-        `${s.screenId}.${s.viewport}.png`,
-      );
+      assets.push({
+        field: `screenshot[${s.screenId}][${s.viewport}]`,
+        name: `${s.screenId}.${s.viewport}.png`,
+        type: "image/png",
+        data: s.buffer,
+      });
       uploadedShots++;
     }
     // Gzipped on the client: the graph is repetitive JSON and compresses ~8x,
     // which is what makes it cheaper to ship than the PNG beside it.
     if (s.scene) {
       const gz = gzipSync(Buffer.from(JSON.stringify(s.scene), "utf8"), { level: 9 });
-      form.set(
-        `scene[${s.screenId}][${s.viewport}]`,
-        new Blob([gz], { type: "application/gzip" }),
-        `${s.screenId}.${s.viewport}.json.gz`,
-      );
+      assets.push({
+        field: `scene[${s.screenId}][${s.viewport}]`,
+        name: `${s.screenId}.${s.viewport}.json.gz`,
+        type: "application/gzip",
+        data: gz,
+      });
       uploadedScenes++;
     }
   }
 
-  // One copy per sync, not per screen — see the route's own note on why these
-  // are both unskippable and worth deduplicating.
-  if (fontFaces) {
-    form.set("fontFaces", new Blob([fontFaces], { type: "text/css" }), "fonts.css");
+  /*
+   * Sent in batches, because a working capture is bigger than one request.
+   *
+   * A sync used to be a single multipart body, which held only while the
+   * screens came back as spinners. Once they rendered for real, 96 of them
+   * came to 5.3MB and the gateway refused the lot — and that size is not an
+   * anomaly to be trimmed, it is what a real app weighs.
+   *
+   * The first request carries the manifest and makes the snapshot; the rest
+   * name that snapshot and carry only assets. A single file larger than the
+   * budget still goes on its own rather than being dropped: it is one screen,
+   * and the server can refuse it more usefully than the plugin can.
+   */
+  const BUDGET = 3 * 1024 * 1024;
+  const batches = [[]];
+  let batchBytes = 0;
+  for (const asset of assets) {
+    if (batchBytes > 0 && batchBytes + asset.data.byteLength > BUDGET) {
+      batches.push([]);
+      batchBytes = 0;
+    }
+    batches.at(-1).push(asset);
+    batchBytes += asset.data.byteLength;
   }
 
-  const res = await apiFetch(`/api/projects/${projectId}/snapshots`, {
-    method: "POST",
-    body: form,
-  });
+  const manifestBlob = () =>
+    new Blob([JSON.stringify(manifest)], { type: "application/json" });
+
+  let res;
+  let snapshotId = null;
+  // Summed across the batches. Each response counts only its own share, so
+  // reading the last one reported a fraction of what was actually stored.
+  const totals = {
+    uploaded_screenshots: 0,
+    reused_screenshots: 0,
+    uploaded_scenes: 0,
+    reused_scenes: 0,
+  };
+  for (const [index, batch] of batches.entries()) {
+    const form = new FormData();
+    form.set("manifest", manifestBlob(), "manifest.json");
+    form.set(
+      "syncedFrom",
+      new Blob(
+        [JSON.stringify({ hostname: os.hostname(), pluginVersion: pluginVersion ?? "0.1.0" })],
+        { type: "application/json" },
+      ),
+    );
+    if (snapshotId) form.set("snapshotId", snapshotId);
+    for (const a of batch) {
+      form.set(a.field, new Blob([a.data], { type: a.type }), a.name);
+    }
+    // One copy per sync, not per screen — see the route's own note on why
+    // these are both unskippable and worth deduplicating.
+    if (fontFaces && index === 0) {
+      form.set("fontFaces", new Blob([fontFaces], { type: "text/css" }), "fonts.css");
+    }
+
+    res = await apiFetch(`/api/projects/${projectId}/snapshots`, {
+      method: "POST",
+      body: form,
+    });
+    if (!res.ok) break;
+    const reply = await res.clone().json().catch(() => null);
+    for (const key of Object.keys(totals)) totals[key] += reply?.[key] ?? 0;
+    if (!snapshotId) {
+      // Read once, from the request that created it; the rest are follow-ups
+      // to the same snapshot and say so.
+      snapshotId = reply?.snapshot_id ?? null;
+      if (!snapshotId && batches.length > 1) {
+        throw new Error("sync: server did not return a snapshotId to continue with");
+      }
+    }
+  }
   const body = await res.json().catch(() => ({}));
   if (!res.ok) {
     throw new Error(`snapshot sync failed: ${res.status} ${JSON.stringify(body)}`);
   }
-  return { ...body, uploadedShotsAttempted: uploadedShots, uploadedScenesAttempted: uploadedScenes };
+  return {
+    ...body,
+    ...totals,
+    uploadedShotsAttempted: uploadedShots,
+    uploadedScenesAttempted: uploadedScenes,
+  };
 }
 
 async function readJsonSafe(p) {

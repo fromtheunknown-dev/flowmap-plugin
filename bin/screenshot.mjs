@@ -60,7 +60,135 @@ function findBrowserExecutable() {
   return null;
 }
 
-export async function captureScreenshots({ devServerUrl, screens, viewports = ["desktop", "mobile"], timeout = 8000, concurrency = 2, samplesPerRoute = 1, sampleUrls = {} }) {
+/**
+ * Glob to RegExp, for matching a request URL against a mock rule.
+ *
+ * `*` stops at a path separator and `**` does not, which is the distinction
+ * that lets `**\/chats/*` mean "any host, one chat" rather than "everything".
+ */
+export function globToRegExp(glob) {
+  let out = "";
+  for (let i = 0; i < glob.length; i += 1) {
+    const c = glob[i];
+    if (c === "*") {
+      if (glob[i + 1] === "*") {
+        out += ".*";
+        i += 1;
+      } else {
+        out += "[^/]*";
+      }
+    } else {
+      out += c.replace(/[.+?^${}()|[\]\\]/g, "\\$&");
+    }
+  }
+  return new RegExp(`^${out}$`);
+}
+
+/**
+ * The session a capture runs under.
+ *
+ * A real app does not render its screens to a stranger. dokitalk's dynamic
+ * routes all came back as a spinner or, worse, as the onboarding screen
+ * wearing another route's name: the page starts drawing, asks the API who the
+ * user is, gets a 401, and redirects. Waiting longer only made the wrong
+ * screen more certain.
+ *
+ * So the capture gets a session of its own — a token in storage, and canned
+ * answers for the calls the screens make — declared in the project's config
+ * and used for nothing but this. Rules are tried in order and the first match
+ * answers; anything unmatched goes to the network as usual.
+ */
+/**
+ * Wait for the page to stop changing, rather than for a fixed delay.
+ *
+ * A flat 400ms was a race the capture kept losing differently each run: the
+ * same route came back as a 9-node spinner one time and a full screen the
+ * next, because whether the first render had painted was pure timing. Watching
+ * the tree settle asks the question that was actually meant — is it finished?
+ *
+ * Two equal readings in a row is the signal. A page that never settles (a
+ * spinner animating nodes in and out, a poll on a timer) hits the ceiling and
+ * is captured as it is, which is all that can be said about it.
+ */
+async function settle(page, { step = 250, ceiling = 5000 } = {}) {
+  let previous = -1;
+  for (let waited = 0; waited < ceiling; waited += step) {
+    await new Promise((r) => setTimeout(r, step));
+    let count;
+    try {
+      count = await page.evaluate(() => document.getElementsByTagName("*").length);
+    } catch {
+      return; // navigated away mid-poll; the next read would be meaningless
+    }
+    if (count === previous && waited >= step) return;
+    previous = count;
+  }
+}
+
+async function prepareSession(page, session, unmocked) {
+  if (!session) return;
+  const { localStorage: seed, cookies, mocks } = session;
+
+  if (seed && Object.keys(seed).length > 0) {
+    // Before the document's own scripts, so the first thing the app's auth
+    // check reads is already there. Setting it after the load is too late —
+    // the redirect has usually fired by then.
+    await page.evaluateOnNewDocument((entries) => {
+      try {
+        for (const [key, value] of entries) window.localStorage.setItem(key, value);
+      } catch {
+        // A page served from about:blank or a sandbox has no storage; the
+        // capture is still worth taking without it.
+      }
+    }, Object.entries(seed).map(([k, v]) => [k, String(v)]));
+  }
+
+  if (Array.isArray(cookies) && cookies.length > 0) {
+    try {
+      await page.setCookie(...cookies);
+    } catch {
+      // A malformed cookie should cost that cookie, not the screenshot.
+    }
+  }
+
+  if (!Array.isArray(mocks) || mocks.length === 0) return;
+  await page.setRequestInterception(true);
+  page.on("request", (request) => {
+    const url = request.url();
+    const method = request.method().toUpperCase();
+    const rule = mocks.find(
+      (m) => (!m.method || m.method.toUpperCase() === method) && m.pattern.test(url),
+    );
+    if (!rule) {
+      // Note what the screens asked for and did not get. Defeating the login
+      // is only half of a rendered screen — the other half is the screen's own
+      // data, and a developer cannot write a fixture for a call they cannot
+      // see. Reported at the end of the capture as the list to fill in.
+      const kind = request.resourceType();
+      if (kind === "xhr" || kind === "fetch") {
+        unmocked?.add(`${method} ${url.replace(/[?#].*$/, "")}`);
+      }
+      request.continue().catch(() => {});
+      return;
+    }
+    request
+      .respond({
+        status: rule.status ?? 200,
+        contentType: rule.contentType ?? "application/json",
+        headers: {
+          // The screens call another origin; without this the browser rejects
+          // the answer before the app ever sees it.
+          "Access-Control-Allow-Origin": "*",
+          "Access-Control-Allow-Headers": "*",
+          "Access-Control-Allow-Methods": "*",
+        },
+        body: rule.body,
+      })
+      .catch(() => {});
+  });
+}
+
+export async function captureScreenshots({ devServerUrl, screens, viewports = ["desktop", "mobile"], timeout = 8000, concurrency = 2, samplesPerRoute = 1, sampleUrls = {}, session = null }) {
   const browserExe = findBrowserExecutable();
   if (!browserExe) {
     return { skipped: true, reason: "no-browser", shots: [], fontFaces: "" };
@@ -112,6 +240,8 @@ export async function captureScreenshots({ devServerUrl, screens, viewports = ["
    * Deduplicated by rule, so the fonts every page shares are still stored once.
    */
   const cssRules = new Set();
+  /** API calls the screens made that no mock answered. */
+  const unmocked = new Set();
   /** Hrefs the captured pages linked to, for resolving dynamic routes. */
   const discovered = new Set();
   let pending = staticScreens.flatMap((s) =>
@@ -126,11 +256,11 @@ export async function captureScreenshots({ devServerUrl, screens, viewports = ["
       const routePath = job.url ?? screen.routePath;
       try {
         const page = await browser.newPage();
+        await prepareSession(page, session, unmocked);
         await page.setViewport(VIEWPORTS[viewport]);
         const url = `${devServerUrl.replace(/\/$/, "")}${routePath}`;
         await page.goto(url, { waitUntil: "domcontentloaded", timeout });
-        // small settle delay so client-side hydration paints
-        await new Promise((r) => setTimeout(r, 400));
+        await settle(page);
         const buf = await page.screenshot({ type: "png", fullPage: false });
 
         let scene = null;
@@ -217,6 +347,7 @@ export async function captureScreenshots({ devServerUrl, screens, viewports = ["
     shots,
     fontFaces: [...cssRules].join("\n"),
     resolvedDynamic: resolved.length,
+    unmocked: [...unmocked].sort(),
   };
 }
 
