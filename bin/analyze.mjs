@@ -85,6 +85,24 @@ export async function discoverRoutes(cwd, framework) {
 // ─────────────────────────────────────────────────────────────────────────────
 // Main analyze entry
 // ─────────────────────────────────────────────────────────────────────────────
+/**
+ * Validate the `aliases` block of the project's config.
+ *
+ * A malformed entry is dropped rather than refused: the file is the
+ * developer's, and one bad line should cost that line and nothing else.
+ */
+function readAliases(raw) {
+  if (!raw || typeof raw !== "object") return null;
+  const out = {};
+  for (const [name, values] of Object.entries(raw)) {
+    const usable = (Array.isArray(values) ? values : [values]).filter(
+      (v) => typeof v === "string" && v.length > 0,
+    );
+    if (usable.length > 0) out[name] = usable;
+  }
+  return Object.keys(out).length > 0 ? out : null;
+}
+
 export async function analyze(cwd, opts = {}) {
   const framework = await detectFramework(cwd);
   const adapter = ADAPTERS[framework];
@@ -96,6 +114,7 @@ export async function analyze(cwd, opts = {}) {
 
   const routes = await adapter.discoverRoutes(cwd, framework);
   const sources = await shared.discoverSources(cwd);
+  const aliases = readAliases(opts.aliases);
 
   // Parse all sources, collect imports + navigations per file
   const fileImports = new Map();
@@ -115,7 +134,7 @@ export async function analyze(cwd, opts = {}) {
       continue;
     }
     const imports = shared.extractImports(ast);
-    const navigations = adapter.extractNavigations(ast, source, file, { imports });
+    const navigations = adapter.extractNavigations(ast, source, file, { imports, aliases });
     fileImports.set(file, imports);
     if (navigations.length) fileNavigations.set(file, navigations);
   }

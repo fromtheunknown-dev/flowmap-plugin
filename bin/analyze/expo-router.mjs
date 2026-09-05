@@ -122,6 +122,8 @@ function fileToRoutePath(relFile) {
  * GATE: only symbols imported from "expo-router" are treated as navigation.
  */
 export function extractNavigations(ast, source, filePath, ctx) {
+  /* URL fragments the project has named in `.flowmap/config.json`. */
+  const aliases = ctx?.aliases ?? null;
   const navigations = [];
 
   // Local names imported from "expo-router".
@@ -178,7 +180,7 @@ export function extractNavigations(ast, source, filePath, ctx) {
           ((prop.key.type === "Identifier" && prop.key.name === "pathname") ||
             (prop.key.type === "StringLiteral" && prop.key.value === "pathname"))
         ) {
-          const inner = resolveString(prop.value, scope, source);
+          const inner = resolveString(prop.value, scope, source, aliases);
           if (!inner) return null;
           if (inner.multi) return inner;
           // Object-form pathname — slightly lower confidence than a bare string.
@@ -187,7 +189,7 @@ export function extractNavigations(ast, source, filePath, ctx) {
       }
       return null; // object href with no static pathname
     }
-    return resolveString(expr, scope, source);
+    return resolveString(expr, scope, source, aliases);
   }
 
   traverse(ast, {

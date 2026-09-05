@@ -139,6 +139,8 @@ async function discoverPagesRouterRoutes(cwd) {
  * ctx = { imports } — imports as returned by shared.extractImports(ast).
  */
 export function extractNavigations(ast, source, filePath, ctx) {
+  /* URL fragments the project has named in `.flowmap/config.json`. */
+  const aliases = ctx?.aliases ?? null;
   const navigations = [];
 
   /** Lookup table for identifiers bound to a useRouter() call, in any scope. */
@@ -203,7 +205,7 @@ export function extractNavigations(ast, source, filePath, ctx) {
       if (value?.type === "StringLiteral") {
         resolved = { value: value.value, text: value.value, confidence: 1.0, kind: "static" };
       } else if (value?.type === "JSXExpressionContainer") {
-        resolved = resolveString(value.expression, p.scope, source);
+        resolved = resolveString(value.expression, p.scope, source, aliases);
       }
       if (!resolved) return;
       // Skip pure external/non-http schemas if it's a plain <a>
@@ -238,7 +240,7 @@ export function extractNavigations(ast, source, filePath, ctx) {
             isRouter = true;
           }
           if (isRouter) {
-            const resolved = resolveString(arg0, p.scope, source);
+            const resolved = resolveString(arg0, p.scope, source, aliases);
             emit(`router-${method}`, resolved, p.node);
             return;
           }
@@ -249,7 +251,7 @@ export function extractNavigations(ast, source, filePath, ctx) {
           (method === "assign" || method === "replace") &&
           isWindowLocation(callee.object)
         ) {
-          const resolved = resolveString(arg0, p.scope, source);
+          const resolved = resolveString(arg0, p.scope, source, aliases);
           emit("window-location", resolved, p.node);
           return;
         }
@@ -258,12 +260,12 @@ export function extractNavigations(ast, source, filePath, ctx) {
       // redirect(...) / permanentRedirect(...)
       if (callee.type === "Identifier") {
         if (redirectBindings.has(callee.name) || callee.name === "redirect") {
-          const resolved = resolveString(arg0, p.scope, source);
+          const resolved = resolveString(arg0, p.scope, source, aliases);
           emit("redirect", resolved, p.node);
           return;
         }
         if (permanentRedirectBindings.has(callee.name) || callee.name === "permanentRedirect") {
-          const resolved = resolveString(arg0, p.scope, source);
+          const resolved = resolveString(arg0, p.scope, source, aliases);
           emit("redirect", resolved, p.node);
           return;
         }
@@ -279,7 +281,7 @@ export function extractNavigations(ast, source, filePath, ctx) {
         left.property.name === "href" &&
         isWindowLocation(left.object)
       ) {
-        const resolved = resolveString(p.node.right, p.scope, source);
+        const resolved = resolveString(p.node.right, p.scope, source, aliases);
         emit("window-location", resolved, p.node);
       }
     },

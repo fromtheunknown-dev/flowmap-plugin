@@ -263,6 +263,8 @@ function staticKeyName(keyNode) {
  *   <Link to/screen> / linkTo(path)        → "link"
  */
 export function extractNavigations(ast, source, filePath, ctx) {
+  /* URL fragments the project has named in `.flowmap/config.json`. */
+  const aliases = ctx?.aliases ?? null;
   const navigations = [];
 
   // ── Import gate ───────────────────────────────────────────────────────────
@@ -328,9 +330,9 @@ export function extractNavigations(ast, source, filePath, ctx) {
           pr.type === "ObjectProperty" && staticKeyName(pr.key) === objectKey,
       );
       if (!prop) return null;
-      return resolveString(prop.value, scope, source);
+      return resolveString(prop.value, scope, source, aliases);
     }
-    return resolveString(arg, scope, source);
+    return resolveString(arg, scope, source, aliases);
   }
 
   traverse(ast, {
@@ -382,7 +384,7 @@ export function extractNavigations(ast, source, filePath, ctx) {
           return;
         }
         if (v?.type === "JSXExpressionContainer") {
-          emit("link", resolveString(v.expression, p.scope, source), screenAttr);
+          emit("link", resolveString(v.expression, p.scope, source, aliases), screenAttr);
           return;
         }
       }
@@ -408,7 +410,7 @@ export function extractNavigations(ast, source, filePath, ctx) {
           return;
         }
         // to={someVar} — string-ish, treat as path best-effort.
-        emit("link", resolveString(expr, p.scope, source), toAttr);
+        emit("link", resolveString(expr, p.scope, source, aliases), toAttr);
       }
     },
 
@@ -462,7 +464,7 @@ export function extractNavigations(ast, source, filePath, ctx) {
         // Guard against false positives when nothing was imported from
         // @react-navigation/*: only trust an explicit binding/import.
         if (hasReactNavigationImport || linkToFnNames.size > 0) {
-          emit("link", resolveString(arg0, p.scope, source), p.node);
+          emit("link", resolveString(arg0, p.scope, source, aliases), p.node);
         }
         return;
       }

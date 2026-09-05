@@ -113,7 +113,14 @@ async function runVisualize(args) {
 
   process.stderr.write(`▸ Analyzing ${cwd} ...\n`);
   const t0 = Date.now();
-  const { manifest, stats } = await analyze(cwd, { devServerUrl });
+  // `.flowmap/config.json` may also say what a URL fragment stands for, so a
+  // `${base}/chat` resolves to real screens instead of a dead end; see
+  // `aliases` in the help text.
+  const config = await readFlowmapConfig(cwd);
+  const { manifest, stats } = await analyze(cwd, {
+    devServerUrl,
+    aliases: config?.aliases,
+  });
   process.stderr.write(
     `✓ ${stats.routes} routes, ${stats.edges} edges (${stats.unresolvedEdges} unresolved) — ${Date.now() - t0}ms\n`,
   );
@@ -162,7 +169,7 @@ async function runVisualize(args) {
       viewports: ["desktop", "mobile"],
       // `.flowmap/config.json` may name a URL per dynamic route; see
       // screenshot.mjs for why discovery alone is not always enough.
-      sampleUrls: (await readFlowmapConfig(cwd))?.routeSamples ?? {},
+      sampleUrls: config?.routeSamples ?? {},
     });
     if (cap.skipped) {
       process.stderr.write(`⚠ Screenshots skipped: ${cap.reason}\n`);
@@ -229,7 +236,9 @@ async function runVisualize(args) {
 async function runAnalyzeOnly(args) {
   const cwd = path.resolve(args.cwd ?? process.cwd());
   process.stderr.write(`▸ Analyzing ${cwd} ...\n`);
-  const { manifest, stats } = await analyze(cwd, {});
+  const { manifest, stats } = await analyze(cwd, {
+    aliases: (await readFlowmapConfig(cwd))?.aliases,
+  });
 
   const flowmapDir = path.join(cwd, ".flowmap");
   await fs.mkdir(flowmapDir, { recursive: true });
@@ -342,5 +351,14 @@ The plugin is invoked via Claude Code skills:
   /flowmap visualize
   /flowmap status
   /flowmap logout
+
+.flowmap/config.json (optional, yours to edit):
+  routeSamples  a real URL per dynamic route, so it can be captured
+                  { "/s/chat/[id]": ["/s/chat/42"] }
+  aliases       what a URL fragment stands for, so a navigation built from a
+                variable resolves to real screens instead of a dead end
+                  { "useRoleBase": ["/s", "/t"] }
+                Name the function a value comes from where you can — a variable
+                called \`base\` means something different in every other file.
 `);
 }

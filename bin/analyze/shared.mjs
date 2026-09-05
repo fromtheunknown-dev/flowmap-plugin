@@ -131,17 +131,124 @@ export function extractImports(ast) {
  * unresolved expressions. It is closed over a `nodeText` derived from the AST
  * node `start`/`end` offsets, so callers must pass the original `source`.
  */
-export function resolveString(node, scope, source) {
+/**
+ * How many URLs one template may expand into.
+ *
+ * Two aliases of three meanings each is already nine edges from one line, and
+ * past that the graph says less than the single `[param]` it replaced.
+ */
+const MAX_ALIAS_EXPANSION = 12;
+
+export function resolveString(node, scope, source, aliases) {
   function nodeText(n) {
     if (n?.start == null || n?.end == null) return "<expr>";
     return source.slice(n.start, n.end);
   }
+
+  /**
+   * The meanings the project has declared for an expression, or null.
+   *
+   * A name can be given directly (`roleBase`), or as the function it comes
+   * from (`useRoleBase`). Naming the function is the steadier of the two: a
+   * variable called `base` means something different in every other file,
+   * while the function it was assigned from means one thing everywhere.
+   */
+  function aliasValues(n, sc) {
+    if (!aliases || n?.type !== "Identifier") return null;
+    const direct = aliases[n.name];
+    if (direct) return direct;
+    const init = sc?.getBinding(n.name)?.path?.node?.init;
+    const callee = init?.type === "CallExpression" ? init.callee : null;
+    const fn =
+      callee?.type === "Identifier"
+        ? callee.name
+        : callee?.type === "MemberExpression" && callee.property?.type === "Identifier"
+          ? callee.property.name
+          : null;
+    return (fn && aliases[fn]) || null;
+  }
+  /**
+   * What one `${...}` can stand for, or null when it stays a wildcard.
+   *
+   * The project's own declaration wins; failing that the ordinary resolver is
+   * asked, so a slot filled from a variable that itself holds a literal — or a
+   * choice between two — resolves like anything else. Anything still open
+   * stays `[param]`.
+   */
+  function slotValues(n, sc) {
+    const declared = aliasValues(n, sc);
+    if (declared) return declared;
+    // `TAB_SUFFIX[tab]` — which key is picked is a runtime choice, but the set
+    // of destinations is written out in full and every one of them is real.
+    const table = tableValues(n, sc);
+    if (table) return table;
+    const resolved = rec(n, sc);
+    if (!resolved) return null;
+    const branches = resolved.multi ?? [resolved];
+    const values = branches
+      .map((b) => b?.value)
+      .filter((v) => typeof v === "string" && v.length > 0);
+    return values.length > 0 ? values : null;
+  }
+
+  /** Every string value of `const X = { a: "/chat", b: "/me" }`. */
+  function tableValues(n, sc) {
+    if (n?.type !== "MemberExpression" || n.object?.type !== "Identifier") return null;
+    const init = sc?.getBinding(n.object.name)?.path?.node?.init;
+    if (init?.type !== "ObjectExpression") return null;
+    const values = [];
+    for (const prop of init.properties) {
+      if (prop.type !== "ObjectProperty" || prop.value?.type !== "StringLiteral") return null;
+      values.push(prop.value.value);
+    }
+    return values.length > 0 && values.length <= MAX_ALIAS_EXPANSION ? values : null;
+  }
+
+  // Following bindings can, in pathological source (`const a = a + "/x"`),
+  // arrive back where it started. Depth is the cheap way to be sure it stops.
+  let depth = 0;
   function rec(n, sc) {
-    if (!n) return null;
+    if (!n || depth > 12) return null;
+    depth += 1;
+    try {
+      return step(n, sc);
+    } finally {
+      depth -= 1;
+    }
+  }
+
+  function step(n, sc) {
     if (n.type === "StringLiteral") {
       return { value: n.value, text: n.value, confidence: 1.0, kind: "static" };
     }
     if (n.type === "TemplateLiteral") {
+      // Every `${...}` becomes `[param]` unless the project has said what it
+      // stands for, in which case the template expands into one URL per
+      // meaning. `${base}/onboarding` is two real screens, not one dead end.
+      const slots = n.expressions.map((e) => slotValues(e, sc));
+      const total = slots.reduce((acc, slot) => acc * (slot ? slot.length : 1), 1);
+      if (slots.some(Boolean) && total <= MAX_ALIAS_EXPANSION) {
+        let urls = [""];
+        for (let i = 0; i < n.quasis.length; i++) {
+          const literal = n.quasis[i].value.cooked ?? "";
+          urls = urls.map((u) => u + literal);
+          if (i >= n.expressions.length) continue;
+          const slot = slots[i];
+          urls = slot
+            ? urls.flatMap((u) => slot.map((value) => u + value))
+            : urls.map((u) => u + "[param]");
+        }
+        return {
+          multi: urls.map((value) => ({
+            value,
+            text: nodeText(n),
+            // Declared by the project, so it outranks anything inferred, but
+            // still short of a literal written at the call site.
+            confidence: value.includes("[param]") ? 0.85 : 0.9,
+            kind: value.includes("[param]") ? "alias-pattern" : "alias-static",
+          })),
+        };
+      }
       let pattern = "";
       for (let i = 0; i < n.quasis.length; i++) {
         pattern += n.quasis[i].value.cooked ?? "";
@@ -150,6 +257,15 @@ export function resolveString(node, scope, source) {
       return { value: pattern, text: nodeText(n), confidence: 0.85, kind: "pattern" };
     }
     if (n.type === "Identifier") {
+      // `location.replace(roleBase)` — the whole URL is the alias.
+      const declared = aliasValues(n, sc);
+      if (declared) {
+        return {
+          multi: declared.map((value) => ({
+            value, text: n.name, confidence: 0.9, kind: "alias-static",
+          })),
+        };
+      }
       const binding = sc?.getBinding(n.name);
       const init = binding?.path?.node?.init;
       if (init) {
@@ -164,11 +280,36 @@ export function resolveString(node, scope, source) {
           }
           return { value: pattern, text: nodeText(n), confidence: 0.6, kind: "pattern-via-var" };
         }
+        // `const base = isTeacher ? "/t" : "/s"` — the same two-branch rule a
+        // conditional written at the call site already gets, one binding
+        // further out. Both branches are real destinations either way.
+        if (init.type === "ConditionalExpression") {
+          const branches = rec(init, binding.path.scope ?? sc);
+          if (branches?.multi) return branches;
+        }
       }
       return { value: null, text: n.name, confidence: 0.4, kind: "unresolved-ident" };
     }
     if (n.type === "JSXExpressionContainer") {
       return rec(n.expression, sc);
+    }
+    // `base + TAB_SUFFIX[tab]` — a URL assembled with `+` rather than a
+    // template. Each side is resolved the same way a `${...}` slot is, and the
+    // result is every combination the two sides allow.
+    if (n.type === "BinaryExpression" && n.operator === "+") {
+      const left = slotValues(n.left, sc);
+      const right = slotValues(n.right, sc);
+      if (left && right && left.length * right.length <= MAX_ALIAS_EXPANSION) {
+        const urls = left.flatMap((a) => right.map((b) => a + b));
+        return {
+          multi: urls.map((value) => ({
+            value,
+            text: nodeText(n),
+            confidence: value.includes("[param]") ? 0.7 : 0.8,
+            kind: "concat",
+          })),
+        };
+      }
     }
     if (n.type === "ConditionalExpression") {
       // Capture both branches as separate navigations — caller flattens
