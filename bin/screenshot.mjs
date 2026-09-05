@@ -98,7 +98,20 @@ export async function captureScreenshots({ devServerUrl, screens, viewports = ["
   );
 
   const shots = [];
-  let fontFaces = "";
+  /*
+   * The stylesheet rules the scenes need, pooled across every page visited.
+   *
+   * This used to keep the first page's blob and drop the rest, on the theory
+   * that a site's fonts are the same everywhere. They are — but the same blob
+   * also carries each page's `:root` tokens and its rules for the inside of
+   * form controls, and those are not. The match screen's
+   * `::-webkit-slider-thumb` rules were collected and then thrown away because
+   * a screen with no slider happened to be captured first, so its rebuilt
+   * sliders had no thumbs however well the renderer behaved.
+   *
+   * Deduplicated by rule, so the fonts every page shares are still stored once.
+   */
+  const cssRules = new Set();
   /** Hrefs the captured pages linked to, for resolving dynamic routes. */
   const discovered = new Set();
   let pending = staticScreens.flatMap((s) =>
@@ -125,7 +138,9 @@ export async function captureScreenshots({ devServerUrl, screens, viewports = ["
           const captured = await captureSceneGraph(page, VIEWPORTS[viewport]);
           scene = captured.scene;
           // Identical on every route, so the first one that comes back wins.
-          if (!fontFaces && captured.fontFaces) fontFaces = captured.fontFaces;
+          for (const rule of (captured.fontFaces ?? "").split("\n")) {
+            if (rule.trim()) cssRules.add(rule);
+          }
         } catch {
           // Scene capture is additive: a screen without one is still viewable,
           // just not editable. Never let it cost us the screenshot.
@@ -197,7 +212,12 @@ export async function captureScreenshots({ devServerUrl, screens, viewports = ["
   }
 
   await browser.close();
-  return { skipped: false, shots, fontFaces, resolvedDynamic: resolved.length };
+  return {
+    skipped: false,
+    shots,
+    fontFaces: [...cssRules].join("\n"),
+    resolvedDynamic: resolved.length,
+  };
 }
 
 

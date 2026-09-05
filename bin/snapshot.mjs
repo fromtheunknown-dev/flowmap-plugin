@@ -166,10 +166,13 @@ export async function captureSceneGraph(page, viewport) {
       }
 
       if (custom.size > 0) {
+        // One line, like every other entry here: the caller merges the blobs
+        // from all the pages it visits by deduplicating them line by line, and
+        // a rule spread over several lines would not survive that.
         const declarations = [...custom]
-          .map(([name, value]) => `  ${name}: ${value};`)
-          .join("\n");
-        out.push(`:root {\n${declarations}\n}`);
+          .map(([name, value]) => `${name}: ${value};`)
+          .join(" ");
+        out.push(`:root { ${declarations} }`);
       }
       return out.join("\n");
     });
