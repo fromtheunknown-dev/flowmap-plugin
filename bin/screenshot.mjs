@@ -99,20 +99,49 @@ export function globToRegExp(glob) {
  * answers; anything unmatched goes to the network as usual.
  */
 /**
- * Wait for the page to stop changing, rather than for a fixed delay.
+ * Count the requests a page still has outstanding.
+ *
+ * Must be attached before the first navigation, since the interesting requests
+ * start with it.
+ */
+function watchRequests(page) {
+  const open = new Set();
+  page.on("request", (r) => open.add(r));
+  const close = (r) => open.delete(r);
+  page.on("requestfinished", close);
+  page.on("requestfailed", close);
+  return () => open.size;
+}
+
+/**
+ * Wait for the page to finish, rather than for a fixed delay.
  *
  * A flat 400ms was a race the capture kept losing differently each run: the
- * same route came back as a 9-node spinner one time and a full screen the
- * next, because whether the first render had painted was pure timing. Watching
- * the tree settle asks the question that was actually meant — is it finished?
+ * same route came back as a nine-node spinner one time and a full screen the
+ * next, because whether the first render had painted was pure timing.
  *
- * Two equal readings in a row is the signal. A page that never settles (a
- * spinner animating nodes in and out, a poll on a timer) hits the ceiling and
- * is captured as it is, which is all that can be said about it.
+ * A settled DOM alone is not the answer either, and believing it was cost a
+ * whole sync. A page waiting on a fetch holds perfectly still — one screen sat
+ * at 61 nodes from 400ms to 1500ms and only then became 111 — so two equal
+ * readings arrive long before the screen does, and every route came back as
+ * its loading shell.
+ *
+ * Finished means both: nothing outstanding on the network, and a tree that has
+ * stopped changing since — held for several samples running, not seen once.
+ * A single quiet reading is not enough, because the quietest moment of all is
+ * the one before the work starts: with two pages sharing a dev server, one
+ * would be sampled after its shell painted and before React had fired a
+ * request, and captured as sixteen nodes of nothing. Anything the page is
+ * about to do begins well inside the streak and resets it.
+ *
+ * A page that never reaches that (a spinner animating nodes in and out, a poll
+ * on a timer, an open socket) hits the ceiling and is captured as it is, which
+ * is all that can be said about it.
  */
-async function settle(page, { step = 250, ceiling = 5000 } = {}) {
+async function settle(page, inFlight, { step = 250, quiet = 3, floor = 1200, ceiling = 10000 } = {}) {
   let previous = -1;
-  for (let waited = 0; waited < ceiling; waited += step) {
+  let still = 0;
+  for (let waited = step; waited <= ceiling; waited += step) {
     await new Promise((r) => setTimeout(r, step));
     let count;
     try {
@@ -120,8 +149,10 @@ async function settle(page, { step = 250, ceiling = 5000 } = {}) {
     } catch {
       return; // navigated away mid-poll; the next read would be meaningless
     }
-    if (count === previous && waited >= step) return;
+    const idle = (!inFlight || inFlight() === 0) && count === previous;
+    still = idle ? still + 1 : 0;
     previous = count;
+    if (still >= quiet && waited >= floor) return;
   }
 }
 
@@ -188,7 +219,22 @@ async function prepareSession(page, session, unmocked) {
   });
 }
 
-export async function captureScreenshots({ devServerUrl, screens, viewports = ["desktop", "mobile"], timeout = 8000, concurrency = 2, samplesPerRoute = 1, sampleUrls = {}, session = null }) {
+/*
+ * One page at a time.
+ *
+ * Two was faster and wrong. With two pages sharing a dev server, one of them
+ * came back as its sixteen-node shell — a different one each run, sometimes
+ * the desktop capture and sometimes the mobile — while the same route captured
+ * alone was complete every time. The server compiles a route on first request,
+ * and under a second concurrent visit that page can be left never finishing
+ * its hydration.
+ *
+ * No amount of waiting fixes it: the stalled page is genuinely quiet, with
+ * nothing outstanding and nothing changing, so it looks finished. A sync runs
+ * occasionally and its output is the whole product; taking twice as long to be
+ * reproducible is the easy side of that trade.
+ */
+export async function captureScreenshots({ devServerUrl, screens, viewports = ["desktop", "mobile"], timeout = 8000, concurrency = 1, samplesPerRoute = 1, sampleUrls = {}, session = null }) {
   const browserExe = findBrowserExecutable();
   if (!browserExe) {
     return { skipped: true, reason: "no-browser", shots: [], fontFaces: "" };
@@ -256,11 +302,12 @@ export async function captureScreenshots({ devServerUrl, screens, viewports = ["
       const routePath = job.url ?? screen.routePath;
       try {
         const page = await browser.newPage();
+        const inFlight = watchRequests(page);
         await prepareSession(page, session, unmocked);
         await page.setViewport(VIEWPORTS[viewport]);
         const url = `${devServerUrl.replace(/\/$/, "")}${routePath}`;
         await page.goto(url, { waitUntil: "domcontentloaded", timeout });
-        await settle(page);
+        await settle(page, inFlight);
         const buf = await page.screenshot({ type: "png", fullPage: false });
 
         let scene = null;
